@@ -106,10 +106,14 @@ void _psCreateFolder(const char *path)
  */
 const char *_psGetUserFilesFolder()
 {
+#ifdef __APPLE__
+	return GetMacOSUserFilesFolder();
+#else
     static char szUserFiles[256];
     strcpy(szUserFiles, "userfiles");
     _psCreateFolder(szUserFiles);
     return szUserFiles;
+#endif
 }
 
 /*
@@ -617,7 +621,8 @@ psSelectDevice()
 #endif
 
 #ifndef PS2_MENU
-    FrontEndMenuManager.m_nCurrOption = 0;
+    if (!useDefault)
+        FrontEndMenuManager.m_nCurrOption = 0;
 #endif
 
     /* Set up the video mode and set the apps window
@@ -703,7 +708,10 @@ void _InputInitialiseJoys()
         char SDL_GAMEPAD_DB_PATH[MAX_PATH];
         snprintf(SDL_GAMEPAD_DB_PATH, sizeof(SDL_GAMEPAD_DB_PATH), "%s%s", pathRoot, "gamecontrollerdb.txt");
 #else
-        const char* SDL_GAMEPAD_DB_PATH = "gamecontrollerdb.txt";
+        char bundledPath[FILEMGR_PATH_SIZE];
+        const char* SDL_GAMEPAD_DB_PATH = CFileMgr::ResolveBundledGameFile(
+            "gamecontrollerdb.txt", bundledPath, sizeof(bundledPath)) ?
+            bundledPath : "gamecontrollerdb.txt";
 #endif
         if (SDL_GameControllerAddMappingsFromFile(SDL_GAMEPAD_DB_PATH) <= 0) {
             debug ("You don't seem to have copied %s file from reVC/gamefiles "
@@ -774,6 +782,24 @@ bool _InputMouseNeedsExclusive()
 	return !(vm.flags & rwVIDEOMODEEXCLUSIVE) || lastCursorMode == GLFW_CURSOR_HIDDEN;
 #endif
     return false;
+}
+
+// Relative mouse support: the game derives deltas from polled positions,
+// but confined positions stall at window/monitor edges. Accumulate the true
+// deltas from the motion events instead; the game consumes them once per frame.
+static bool mouseRelativeMode = false;
+static int mouseRelX = 0, mouseRelY = 0;
+
+bool _InputMouseIsRelative(void)
+{
+    return mouseRelativeMode;
+}
+
+void _InputConsumeMouseRelative(int *dx, int *dy)
+{
+    *dx = mouseRelX;
+    *dy = mouseRelY;
+    mouseRelX = mouseRelY = 0;
 }
 
 void psPostRWinit(void)
@@ -1260,9 +1286,12 @@ cursorEnterCB(int entered) {
     PSGLOBAL(cursorIsInWindow) = !!entered;
 }
 
-void
-windowFocusCB(int focused) {
+void windowFocusCB(int focused) {
     WindowFocused = !!focused;
+    if (!focused) {
+        // deltas accumulated while unfocused must not fire on refocus
+        mouseRelX = mouseRelY = 0;
+    }
 }
 
 void
@@ -1273,14 +1302,18 @@ windowIconifyCB(int iconified) {
 void inputEventHandler() {
     SDL_Event event;
 
-    if (SDL_PollEvent(&event)) {
+    while (SDL_PollEvent(&event)) {
         switch (event.type) {
             case SDL_KEYDOWN:	/* fall-through */
             case SDL_KEYUP:
                 keypressCB(event.key.keysym.sym, event.type, 0);
                 break;
 
-            case SDL_MOUSEMOTION: cursorCB(event.motion.x, event.motion.y); break;
+            case SDL_MOUSEMOTION:
+                cursorCB(event.motion.x, event.motion.y);
+                mouseRelX += event.motion.xrel;
+                mouseRelY += event.motion.yrel;
+                break;
             case SDL_MOUSEWHEEL: scrollCB(event.wheel.x, event.wheel.y); break;
 
             // note that SDL_CONTROLLERDEVICEADDED/REMOVED exists, but it did not work for me
@@ -1305,6 +1338,34 @@ void inputEventHandler() {
                 break;
         }
     }
+
+    // Grab the mouse during gameplay (GLFW_CURSOR_DISABLED equivalent):
+    // relative motion + pointer confinement, so the hidden cursor can't
+    // wander off to another monitor or stall at the window edge.
+    // The frontend needs absolute positions, so keep it free there.
+    bool wantRelative = gGameState == GS_PLAYING_GAME &&
+                        !FrontEndMenuManager.m_bMenuActive && !WindowIconified;
+    if (wantRelative != mouseRelativeMode) {
+        if (SDL_SetRelativeMouseMode(wantRelative ? SDL_TRUE : SDL_FALSE) == 0) {
+            mouseRelativeMode = wantRelative;
+            mouseRelX = mouseRelY = 0;
+            if (wantRelative) {
+                PSGLOBAL(cursorIsInWindow) = true;
+            } else {
+                int x, y;
+                SDL_GetMouseState(&x, &y);
+                PSGLOBAL(lastMousePos.x) = x;
+                PSGLOBAL(lastMousePos.y) = y;
+            }
+        } else {
+            // switch failed: never leave the menu with a grabbed pointer and
+            // garbage coordinates — release the grab and fall back to polling
+            SDL_SetWindowGrab(PSGLOBAL(window), SDL_FALSE);
+            SDL_ShowCursor(SDL_DISABLE);
+            mouseRelativeMode = false;
+        }
+    }
+    
 }
 
 /*
